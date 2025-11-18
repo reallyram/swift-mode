@@ -142,6 +142,9 @@ otherwise.")
 (defvar swift-mode:ios-project-scheme nil
   "Scheme to use in Xcode project for building/debugging.")
 
+(defvar swift-mode:ios-project-configuration "Debug"
+  "Configuration to use in Xcode project for building/debugging.")
+
 (defun swift-mode:command-list-to-string (cmd)
   "Concatenate the CMD unless it is a string.
 
@@ -249,7 +252,38 @@ Returns the exit status."
 EXECUTABLE may be a string or a list.  The string is split by spaces,
 then unquoted.
 ARGS are rest arguments, appended to the argument list."
-  (swift-mode:do-call-process executable nil 0 nil args))
+  (swift-mode:do-call-process-async executable 0 args))
+
+
+(defun swift-mode:do-call-process-async (executable destination args)
+    "Wrapper for `call-process-async'.
+
+EXECUTABLE may be a string or a list.  The string is split by spaces,
+then unquoted.
+For INFILE, DESTINATION, DISPLAY, see `call-process'.
+ARGS are rest arguments, appended to the argument list.
+Returns the exit status."
+
+  (let* ((command-list (append (swift-mode:command-string-to-list executable) args))
+         (program (car command-list))
+         (program-args (cdr command-list))
+         ;; Build a shell command string because compilation-start expects a string
+         (full-command
+          (mapconcat #'shell-quote-argument (cons program program-args) " "))
+         (buffer-name (or (when (consp destination) (car destination))
+                          (when (bufferp destination) (buffer-name destination))
+                          (when (stringp destination) destination)
+                          "*swift-compilation*")))
+
+    ;; Start the async compilation
+    (compilation-start
+     full-command
+     nil  ; mode – nil means use default `compilation-mode`
+     (lambda (_mode-name) buffer-name))
+
+    ;; Return something non-nil so old code that checks (when (zerop result) ...) still kinda works
+    ;; (most swift-mode callers just ignore the return value anyway)
+    (get-buffer-process (get-buffer buffer-name))))
 
 (defun swift-mode:do-call-process (executable infile destination display args)
   "Wrapper for `call-process'.
@@ -463,19 +497,21 @@ or its ancestors."
 (defun swift-mode:read-xcode-build-settings (project-directory
                                              scheme
                                              sdk
-                                             device-identifier)
+                                             device-identifier
+                                             config)
   "Read Xcode build settings in PROJECT-DIRECTORY.
 
 SCHEME is the name of the project scheme in Xcode.
 SDK is the name of the SDK build against.
 DEVICE-IDENTIFIER is used as the destination parameter for xcodebuild.  If
 identifier is equal to `swift-mode:ios-local-device-identifier', it is not
-passed as a destination to xcodebuild."
+passed as a destination to xcodebuild.
+CONFIG config for build."
   (with-temp-buffer
     (let ((default-directory project-directory)
           (arglist `(,swift-mode:xcodebuild-executable
                      "-configuration"
-                     "Debug"
+                     ,config
                      "-sdk"
                      ,sdk
                      "-scheme"
@@ -576,7 +612,8 @@ An list ARGS are appended for builder command line arguments."
 ;;;###autoload
 (defun swift-mode:build-ios-app (&optional project-directory
                                            device-identifier
-                                           scheme)
+                                           scheme
+                                           config)
   "Build an iOS app in the PROJECT-DIRECTORY.
 Build it for iOS device DEVICE-IDENTIFIER for the given SCHEME.
 If PROJECT-DIRECTORY is nil or omitted, it is searched from `default-directory'
@@ -586,7 +623,8 @@ or omitted, the value of `swift-mode:ios-device-identifier' is used.  If it is
 equal to `swift-mode:ios-local-device-identifier', a local device is used via
 `ios-deploy' instead.
 SCHEME is the name of the project scheme in Xcode.  If it is nil or omitted,
-the value of `swift-mode:ios-project-scheme' is used."
+the value of `swift-mode:ios-project-scheme' is used.
+CONFIG is the configuration for build/debug Debug/Release etc."
   (interactive
    (let* ((default-project-directory
            (or
@@ -618,13 +656,16 @@ the value of `swift-mode:ios-project-scheme' is used."
            swift-mode:ios-project-scheme
            (swift-mode:read-project-scheme project-directory))))
   (setq swift-mode:ios-project-scheme scheme)
+  (unless config
+    (setq config swift-mode:ios-project-configuration))
+  (setq swift-mode:ios-project-configuration config)
 
   (with-current-buffer (get-buffer-create "*swift-mode:compilation*")
     (fundamental-mode)
     (setq buffer-read-only nil)
     (let ((progress-reporter (make-progress-reporter "Building..."))
           (xcodebuild-args `(,swift-mode:xcodebuild-executable
-                             "-configuration" "Debug"
+                             "-configuration" ,config
                              "-scheme" ,scheme)))
       (if (equal device-identifier swift-mode:ios-local-device-identifier)
           (setq xcodebuild-args (append xcodebuild-args '("-sdk" "iphoneos")))
@@ -636,7 +677,7 @@ the value of `swift-mode:ios-project-scheme' is used."
       (unless
           (zerop
            (let ((default-directory project-directory))
-             (apply #'swift-mode:call-process xcodebuild-args)))
+             (apply #'swift-mode:call-process-async xcodebuild-args)))
         (compilation-mode)
         (goto-char (point-min))
         (pop-to-buffer (current-buffer))
@@ -907,7 +948,8 @@ in Xcode build settings."
 ;;;###autoload
 (defun swift-mode:debug-ios-app (&optional project-directory
                                            device-identifier
-                                           scheme)
+                                           scheme
+                                           config)
   "Run debugger on an iOS app in the PROJECT-DIRECTORY.
 Run it for the iOS simulator device DEVICE-IDENTIFIER for the given SCHEME.
 If PROJECT-DIRECTORY is nil or omitted, it is searched from `default-directory'
@@ -917,7 +959,8 @@ nil or omitted, the value of `swift-mode:ios-device-identifier' is used.  If
 it is equal to `swift-mode:ios-local-device-identifier', a local build via
 `ios-deploy' is generated instead.
 SCHEME is the name of the project scheme in Xcode.  If it is nil or omitted,
-the value of `swift-mode:ios-project-scheme' is used."
+the value of `swift-mode:ios-project-scheme' is used.
+CONFIG config for build Debug / Release etc."
   (interactive
    (let* ((default-project-directory
            (or
@@ -949,6 +992,9 @@ the value of `swift-mode:ios-project-scheme' is used."
            swift-mode:ios-project-scheme
            (swift-mode:read-project-scheme project-directory))))
   (setq swift-mode:ios-project-scheme scheme)
+  (unless config
+    (setq config swift-mode:ios-project-configuration))
+  (setq swift-mode:ios-project-configuration config)
   (let* ((local-device-build (equal device-identifier
                                     swift-mode:ios-local-device-identifier))
          (sdk (if local-device-build "iphoneos" "iphonesimulator"))
@@ -957,7 +1003,8 @@ the value of `swift-mode:ios-project-scheme' is used."
            project-directory
            scheme
            sdk
-           device-identifier))
+           device-identifier
+           config))
          (codesigning-folder-path
           (assoc-default "CODESIGNING_FOLDER_PATH" build-settings))
          (product-bundle-identifier
