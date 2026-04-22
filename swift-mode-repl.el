@@ -142,8 +142,11 @@ otherwise.")
 (defvar swift-mode:ios-project-scheme nil
   "Scheme to use in Xcode project for building/debugging.")
 
-(defvar swift-mode:ios-project-configuration "Debug"
-  "Configuration to use in Xcode project for building/debugging.")
+(defvar swift-mode:ios-project-configuration nil
+  "Configuration to use in Xcode project for building/debugging.
+
+When nil, the user is prompted to pick one from the project's available
+build configurations and the answer is cached here for subsequent calls.")
 
 (defun swift-mode:command-list-to-string (cmd)
   "Concatenate the CMD unless it is a string.
@@ -465,6 +468,20 @@ or its ancestors."
     (error "Not a project directory"))
   project-directory)
 
+(defun swift-mode:xcodebuild-project-args (project-directory)
+  "Return xcodebuild arguments selecting the workspace or project.
+
+PROJECT-DIRECTORY is the directory containing a *.xcworkspace or *.xcodeproj.
+Prefer the workspace when both are present, since xcodebuild requires
+`-workspace' to build workspace-based projects (e.g. CocoaPods, SwiftPM
+integrations)."
+  (let ((workspaces (directory-files project-directory t ".*\\.xcworkspace\\'"))
+        (projects (directory-files project-directory t ".*\\.xcodeproj\\'")))
+    (cond
+     (workspaces (list "-workspace" (car workspaces)))
+     (projects (list "-project" (car projects)))
+     (t nil))))
+
 (defun swift-mode:list-ios-simulators ()
   "List iOS simulator devices, device types, runtimes, or device pairs."
   (swift-mode:call-process-to-json
@@ -510,6 +527,8 @@ CONFIG config for build."
   (with-temp-buffer
     (let ((default-directory project-directory)
           (arglist `(,swift-mode:xcodebuild-executable
+                     ,@(swift-mode:xcodebuild-project-args project-directory)
+                     "-disableAutomaticPackageResolution"
                      "-configuration"
                      ,config
                      "-sdk"
@@ -533,14 +552,155 @@ CONFIG config for build."
         (push (cons (match-string 1) (match-string 2)) settings))
       settings)))
 
-(defun swift-mode:xcodebuild-list (project-directory)
-  "Return the contents of `xcodebuild -list' in PROJECT-DIRECTORY as JSON."
-  (let ((default-directory project-directory)
-        (json-array-type 'list))
-    (swift-mode:call-process-to-json
-     swift-mode:xcodebuild-executable
-     "-list"
-     "-json")))
+(defvar swift-mode:xcodebuild-list-cache nil
+  "Alist cache of `xcodebuild -list -json' output.
+
+Keyed by (EXPANDED-PROJECT-DIRECTORY . XCODE-PROJECT-OR-NIL).  Schemes
+and configurations rarely change within a session, and `xcodebuild
+-list' is slow on projects with many Swift Package dependencies, so we
+memoize.  Call `swift-mode:clear-xcodebuild-cache' to invalidate.")
+
+(defvar swift-mode:xcodebuild-list-in-flight nil
+  "Alist of in-flight `xcodebuild -list' subprocesses.
+
+Each element is (KEY PROCESS STDOUT-BUFFER STDERR-BUFFER) where KEY
+matches `swift-mode:xcodebuild-list-cache'.  Lets callers pre-start an
+xcodebuild call via `swift-mode:start-xcodebuild-list-async' and have
+the next `swift-mode:xcodebuild-list' attach to it instead of starting
+a new one — so xcodebuild runtime can overlap with user widget
+interaction instead of freezing the frame between steps.")
+
+;;;###autoload
+(defun swift-mode:clear-xcodebuild-cache ()
+  "Clear cached `xcodebuild -list' output.
+
+Call this after adding or removing schemes/configurations so the next
+invocation rereads them from xcodebuild.  Also tears down any
+background `xcodebuild -list' processes still in flight."
+  (interactive)
+  (setq swift-mode:xcodebuild-list-cache nil)
+  (dolist (entry swift-mode:xcodebuild-list-in-flight)
+    (let ((proc (nth 1 entry))
+          (stdout-buf (nth 2 entry))
+          (stderr-buf (nth 3 entry)))
+      (when (and proc (process-live-p proc))
+        (delete-process proc))
+      (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
+      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf))))
+  (setq swift-mode:xcodebuild-list-in-flight nil))
+
+(defun swift-mode:--xcodebuild-list-command (project-directory xcode-project)
+  "Build the `xcodebuild -list -json' argument vector.
+
+PROJECT-DIRECTORY is the directory the call should run in.  If
+XCODE-PROJECT is non-nil, pass `-project XCODE-PROJECT'; otherwise let
+`swift-mode:xcodebuild-project-args' pick the workspace or project."
+  (let* ((default-directory project-directory)
+         (project-args
+          (if xcode-project
+              (list "-project" xcode-project)
+            (swift-mode:xcodebuild-project-args project-directory))))
+    (append (swift-mode:command-string-to-list
+             swift-mode:xcodebuild-executable)
+            project-args
+            (list "-list" "-json"
+                  "-disableAutomaticPackageResolution"))))
+
+(defun swift-mode:start-xcodebuild-list-async (project-directory
+                                               &optional xcode-project)
+  "Kick off `xcodebuild -list -json' in the background.
+
+PROJECT-DIRECTORY and optional XCODE-PROJECT identify the cache key.
+No-op if the result is already cached or another call is already in
+flight for the same key.  The result is picked up by the next matching
+`swift-mode:xcodebuild-list' call, so user-facing widget dialogs do not
+have to wait for xcodebuild between steps."
+  (let ((key (cons (expand-file-name project-directory) xcode-project)))
+    (unless (or (assoc key swift-mode:xcodebuild-list-cache)
+                (assoc key swift-mode:xcodebuild-list-in-flight))
+      (let* ((default-directory project-directory)
+             (cmd (swift-mode:--xcodebuild-list-command project-directory
+                                                       xcode-project))
+             (stdout-buf (generate-new-buffer
+                          " *swift-mode:xcodebuild-stdout*"))
+             (stderr-buf (generate-new-buffer
+                          " *swift-mode:xcodebuild-stderr*"))
+             (proc (make-process
+                    :name "swift-mode:xcodebuild-list"
+                    :buffer stdout-buf
+                    :command cmd
+                    :stderr stderr-buf
+                    :connection-type 'pipe
+                    :noquery t)))
+        (push (list key proc stdout-buf stderr-buf)
+              swift-mode:xcodebuild-list-in-flight)))))
+
+(defun swift-mode:--await-xcodebuild-list (entry)
+  "Wait for an in-flight ENTRY from `swift-mode:xcodebuild-list-in-flight'.
+
+ENTRY is (KEY PROCESS STDOUT-BUFFER STDERR-BUFFER).  Pumps subprocess
+output and forces a redisplay each tick so the frame keeps drawing
+instead of freezing.  C-g aborts the subprocess.  On success, caches
+and returns the parsed JSON; on non-zero exit, signals an error.
+Cleans up the in-flight entry and its buffers in any case."
+  (let* ((key (nth 0 entry))
+         (proc (nth 1 entry))
+         (stdout-buf (nth 2 entry))
+         (stderr-buf (nth 3 entry))
+         (label (format "Reading Xcode project info (%s)..."
+                        (file-name-nondirectory
+                         (directory-file-name (car key))))))
+    (unwind-protect
+        (progn
+          (while (process-live-p proc)
+            (message "%s" label)
+            (accept-process-output proc 0.1)
+            (redisplay))
+          ;; Drain any output the sentinel didn't flush.
+          (while (accept-process-output proc 0))
+          (let ((exit (process-exit-status proc)))
+            (unless (zerop exit)
+              (error "xcodebuild -list exited %d: %s" exit
+                     (with-current-buffer stderr-buf (buffer-string)))))
+          (message "")
+          (let* ((json-array-type 'list)
+                 (result (with-current-buffer stdout-buf
+                           (goto-char (point-min))
+                           (json-read))))
+            (push (cons key result) swift-mode:xcodebuild-list-cache)
+            result))
+      (let ((registered (assoc key swift-mode:xcodebuild-list-in-flight)))
+        (when registered
+          (setq swift-mode:xcodebuild-list-in-flight
+                (delq registered swift-mode:xcodebuild-list-in-flight))))
+      (when (and proc (process-live-p proc))
+        (delete-process proc))
+      (when (buffer-live-p stdout-buf) (kill-buffer stdout-buf))
+      (when (buffer-live-p stderr-buf) (kill-buffer stderr-buf)))))
+
+(defun swift-mode:xcodebuild-list (project-directory &optional xcode-project)
+  "Return the contents of `xcodebuild -list' for PROJECT-DIRECTORY as JSON.
+
+If XCODE-PROJECT is non-nil, pass `-project XCODE-PROJECT' instead of
+the default workspace/project detection.  Results are cached in
+`swift-mode:xcodebuild-list-cache'.  `-disableAutomaticPackageResolution'
+is passed so Swift Package resolution does not run on each call.
+
+If the call was pre-started via `swift-mode:start-xcodebuild-list-async',
+attaches to the in-flight subprocess and waits for it; otherwise starts
+a new one.  Either way, the wait is responsive — output is pumped and
+the frame is redisplayed every tick, with a progress message in the
+echo area, so Emacs doesn't appear frozen.  C-g aborts the subprocess."
+  (let* ((key (cons (expand-file-name project-directory) xcode-project))
+         (cached (assoc key swift-mode:xcodebuild-list-cache))
+         (in-flight (assoc key swift-mode:xcodebuild-list-in-flight)))
+    (cond
+     (cached (cdr cached))
+     (in-flight (swift-mode:--await-xcodebuild-list in-flight))
+     (t
+      (swift-mode:start-xcodebuild-list-async project-directory xcode-project)
+      (swift-mode:--await-xcodebuild-list
+       (assoc key swift-mode:xcodebuild-list-in-flight))))))
 
 (defun swift-mode:read-project-scheme (project-directory)
   "Read and prompt for a project's scheme in the minibuffer.
@@ -557,6 +717,33 @@ xcodebuild is executed in PROJECT-DIRECTORY."
       (1 (car schemes))
       (0 nil)
       (_ (widget-choose "Choose a scheme" choices)))))
+
+(defun swift-mode:read-project-configuration (project-directory)
+  "Read and prompt for a project's build configuration in the minibuffer.
+
+xcodebuild is executed in PROJECT-DIRECTORY.  `xcodebuild -list' on a
+workspace returns only schemes, so this falls back to `-list -json
+-project' against the first `*.xcodeproj' in PROJECT-DIRECTORY when the
+workspace itself does not expose configurations."
+  (let* ((json (swift-mode:xcodebuild-list project-directory))
+         (configurations
+          (assoc-default 'configurations (assoc-default 'project json))))
+    (unless configurations
+      (let ((xcodeproj
+             (car (directory-files project-directory t ".*\\.xcodeproj\\'"))))
+        (when xcodeproj
+          (setq configurations
+                (assoc-default
+                 'configurations
+                 (assoc-default
+                  'project
+                  (swift-mode:xcodebuild-list project-directory
+                                              xcodeproj)))))))
+    (let ((choices (seq-map (lambda (c) (cons c c)) configurations)))
+      (pcase (length configurations)
+        (1 (car configurations))
+        (0 (error "No build configurations found in %s" project-directory))
+        (_ (widget-choose "Choose a configuration" choices))))))
 
 (defun swift-mode:locate-xcode ()
   "Return the developer path in Xcode.app.
@@ -613,7 +800,8 @@ An list ARGS are appended for builder command line arguments."
 (defun swift-mode:build-ios-app (&optional project-directory
                                            device-identifier
                                            scheme
-                                           config)
+                                           config
+                                           synchronous)
   "Build an iOS app in the PROJECT-DIRECTORY.
 Build it for iOS device DEVICE-IDENTIFIER for the given SCHEME.
 If PROJECT-DIRECTORY is nil or omitted, it is searched from `default-directory'
@@ -624,7 +812,10 @@ equal to `swift-mode:ios-local-device-identifier', a local device is used via
 `ios-deploy' instead.
 SCHEME is the name of the project scheme in Xcode.  If it is nil or omitted,
 the value of `swift-mode:ios-project-scheme' is used.
-CONFIG is the configuration for build/debug Debug/Release etc."
+CONFIG is the configuration for build/debug Debug/Release etc.
+If SYNCHRONOUS is non-nil, block until the build completes (needed by the
+debug flow, which must install/launch the freshly-built app).  When nil,
+the build runs asynchronously through `compilation-mode'."
   (interactive
    (let* ((default-project-directory
            (or
@@ -641,7 +832,10 @@ CONFIG is the configuration for build/debug Debug/Release etc."
         swift-mode:ios-device-identifier)
       (if current-prefix-arg
           (swift-mode:read-project-scheme project-directory)
-        swift-mode:ios-project-scheme))))
+        swift-mode:ios-project-scheme)
+      (if current-prefix-arg
+          (swift-mode:read-project-configuration project-directory)
+        swift-mode:ios-project-configuration))))
   (setq project-directory
         (swift-mode:ensure-xcode-project-directory project-directory))
   (unless device-identifier
@@ -657,7 +851,10 @@ CONFIG is the configuration for build/debug Debug/Release etc."
            (swift-mode:read-project-scheme project-directory))))
   (setq swift-mode:ios-project-scheme scheme)
   (unless config
-    (setq config swift-mode:ios-project-configuration))
+    (setq config
+          (or
+           swift-mode:ios-project-configuration
+           (swift-mode:read-project-configuration project-directory))))
   (setq swift-mode:ios-project-configuration config)
 
   (with-current-buffer (get-buffer-create "*swift-mode:compilation*")
@@ -665,6 +862,12 @@ CONFIG is the configuration for build/debug Debug/Release etc."
     (setq buffer-read-only nil)
     (let ((progress-reporter (make-progress-reporter "Building..."))
           (xcodebuild-args `(,swift-mode:xcodebuild-executable
+                             ,@(swift-mode:xcodebuild-project-args
+                                project-directory)
+                             "-quiet"
+                             "-disableAutomaticPackageResolution"
+                             "-skipPackagePluginValidation"
+                             "-skipMacroValidation"
                              "-configuration" ,config
                              "-scheme" ,scheme)))
       (if (equal device-identifier swift-mode:ios-local-device-identifier)
@@ -674,40 +877,43 @@ CONFIG is the configuration for build/debug Debug/Release etc."
                       `("-destination"
                         ,(concat "platform=iOS Simulator,id=" device-identifier)
                         "-sdk" "iphonesimulator"))))
-      (unless
-          (zerop
-           (let ((default-directory project-directory))
-             (apply #'swift-mode:call-process-async xcodebuild-args)))
-        (compilation-mode)
-        (goto-char (point-min))
-        (pop-to-buffer (current-buffer))
-        (error "Build error"))
+      (let ((default-directory project-directory))
+        (if synchronous
+            (unless (zerop (apply #'swift-mode:call-process xcodebuild-args))
+              (compilation-mode)
+              (goto-char (point-min))
+              (pop-to-buffer (current-buffer))
+              (error "Build error"))
+          (apply #'swift-mode:call-process-async xcodebuild-args)))
       (kill-buffer)
       (progress-reporter-done progress-reporter))))
 
 (defun swift-mode:wait-for-prompt-then-execute-commands (string)
-  "Execute the next command from the queue if the point is on a prompt.
+  "Execute the next command from the queue if we're at a fresh prompt.
 
-Intended for used as a `comint-output-filter-functions'.
-STRING is passed to the command."
-  (let ((command (car swift-mode:repl-command-queue)))
-    (when (and
-           ;; The point is on an input field of comint.
-           (null (field-at-pos (point)))
-           ;; It is a LLDB prompt rather than that of the target executable.
-           (save-excursion
-             (if (and (consp command) (functionp (car command)))
-                 ;; Calls custom function to search expected output
-                 (funcall (car command) string)
-               (forward-line 0)
-               (looking-at
-                (if (consp command)
-                    ;; Using custom regexp
-                    (car command)
-                  ;; Using standard regexp
-                  swift-mode:debugger-prompt-regexp)))))
-      (when swift-mode:repl-command-queue
+Intended as a `comint-output-filter-functions' hook, but also safe to
+call manually to drain the queue when no further output is expected
+from the REPL.  STRING is passed to any custom command matcher.
+
+\"At a fresh prompt\" here means point is at the process mark — i.e.
+at the tail of the REPL's last output — which distinguishes the LLDB
+prompt from incidental prompt-like text emitted by the target
+executable."
+  (let* ((proc (get-buffer-process (current-buffer)))
+         (pmark (and proc (process-mark proc)))
+         (command (car swift-mode:repl-command-queue)))
+    (when (and command pmark (= (point) pmark))
+      (when (save-excursion
+              (if (and (consp command) (functionp (car command)))
+                  ;; Custom function to detect expected output.
+                  (funcall (car command) string)
+                (forward-line 0)
+                (looking-at
+                 (if (consp command)
+                     (car command)
+                   swift-mode:debugger-prompt-regexp))))
         (pop swift-mode:repl-command-queue)
+        (goto-char pmark)
         (insert (if (consp command) (cdr command) command))
         (comint-send-input))
       (unless swift-mode:repl-command-queue
@@ -721,7 +927,16 @@ STRING is passed to the command."
                 (append swift-mode:repl-command-queue commands))
     (add-hook 'comint-output-filter-functions
               #'swift-mode:wait-for-prompt-then-execute-commands
-              nil t)))
+              nil t)
+    ;; `run-repl' only waits for the first chunk of output, so the REPL's
+    ;; prompt may already be on screen by the time this hook is installed.
+    ;; In that case no further output arrives, the filter never fires, and
+    ;; the queue never drains.  Drain it once synchronously here.
+    (let ((proc (get-buffer-process (current-buffer))))
+      (when proc
+        (save-excursion
+          (goto-char (process-mark proc))
+          (swift-mode:wait-for-prompt-then-execute-commands ""))))))
 
 (defun swift-mode:debug-swift-module-library (project-directory)
   "Run debugger on a Swift library module in the PROJECT-DIRECTORY."
@@ -826,6 +1041,20 @@ CODESIGNING-FOLDER-PATH is the path of the app."
                     codesigning-folder-path))
       (error "%s: %s" "Cannot install app" (buffer-string)))))
 
+(defun swift-mode:terminate-ios-app (device-identifier product-bundle-identifier)
+  "Terminate PRODUCT-BUNDLE-IDENTIFIER on the DEVICE-IDENTIFIER simulator.
+
+Safe when the app is not running — simctl reports a non-zero exit in
+that case, which we intentionally ignore.  Used before `simctl install'
+so any running instance (including one held alive by an orphaned lldb
+from a crashed Emacs session) is released first."
+  (with-temp-buffer
+    (swift-mode:call-process
+     swift-mode:simulator-controller-executable
+     "terminate"
+     device-identifier
+     product-bundle-identifier)))
+
 (defun swift-mode:launch-ios-app (device-identifier
                                   product-bundle-identifier
                                   &optional
@@ -848,16 +1077,29 @@ attaches to it."
     (search-forward-regexp ": \\([0-9]*\\)$")
     (string-to-number (match-string 1))))
 
-(defun swift-mode:search-process-stopped-message (process-identifier)
-  "Find a message of process suspension in the comint output.
+(defun swift-mode:kill-existing-debug-repl ()
+  "Terminate any running lldb/ios-deploy from a previous debug session.
 
-PROCESS-IDENTIFIER is the process ID."
-  (let ((expected-output
-         (concat "Process "
-                 (number-to-string process-identifier)
-                 " stopped")))
-    (goto-char comint-last-input-end)
-    (search-forward expected-output nil t)))
+Called before starting a new debug run so the prior subprocess releases
+the simulator app; otherwise `simctl install' can hang trying to
+replace a bundle whose process is still held open by an attached lldb.
+The buffer is preserved so its history remains reviewable."
+  (dolist (buffer (buffer-list))
+    (let ((name (buffer-name buffer)))
+      (when (and name
+                 (string-match-p
+                  "\\`\\*Swift REPL \\[.*\\(?:lldb\\|ios-deploy\\)"
+                  name)
+                 (comint-check-proc buffer))
+        (let ((proc (get-buffer-process buffer)))
+          (set-process-query-on-exit-flag proc nil)
+          (signal-process proc 'SIGTERM)
+          (let ((deadline (+ (float-time) 2.0)))
+            (while (and (process-live-p proc)
+                        (< (float-time) deadline))
+              (sit-for 0.1)))
+          (when (process-live-p proc)
+            (kill-process proc)))))))
 
 ;;;###autoload
 (defun swift-mode:debug-ios-app-on-device (project-directory
@@ -867,9 +1109,12 @@ PROCESS-IDENTIFIER is the process ID."
 Run it for the iOS local device DEVICE-IDENTIFIER for the given SCHEME.
 CODESIGNING-FOLDER-PATH is the path of the codesigning folder in Xcode
 build settings."
+  (swift-mode:kill-existing-debug-repl)
   (swift-mode:build-ios-app project-directory
                             swift-mode:ios-local-device-identifier
-                            scheme)
+                            scheme
+                            nil
+                            t)
   (swift-mode:run-repl
    (append
     (swift-mode:command-string-to-list swift-mode:ios-deploy-executable)
@@ -890,7 +1135,8 @@ CODESIGNING-FOLDER-PATH is the path of the codesigning folder used in Xcode
 build settings.
 PRODUCT-BUNDLE-IDENTIFIER is the name of the product bundle identifier used
 in Xcode build settings."
-  (swift-mode:build-ios-app project-directory device-identifier scheme)
+  (swift-mode:kill-existing-debug-repl)
+  (swift-mode:build-ios-app project-directory device-identifier scheme nil t)
   (let* ((devices (swift-mode:list-ios-simulator-devices))
          (target-device
           (seq-find
@@ -921,6 +1167,9 @@ in Xcode build settings."
     (progress-reporter-done progress-reporter)
 
     (let ((progress-reporter (make-progress-reporter "Installing app...")))
+      ;; Stop any running instance first so simctl install can replace the
+      ;; bundle.  Handles orphaned lldb attachments from a crashed Emacs.
+      (swift-mode:terminate-ios-app device-identifier product-bundle-identifier)
       (swift-mode:install-ios-app device-identifier codesigning-folder-path)
       (progress-reporter-done progress-reporter))
 
@@ -938,12 +1187,9 @@ in Xcode build settings."
        "platform select ios-simulator"
        (concat "platform connect " device-identifier)
        (concat "process attach --pid " (number-to-string process-identifier))
-       "breakpoint set --one-shot true --name UIApplicationMain"
-       "cont"
-       (cons
-        (lambda (_string)
-          (swift-mode:search-process-stopped-message process-identifier))
-        "repl")))))
+       ;; Resume from the `--wait-for-debugger' suspension so the app runs.
+       ;; Press C-c C-c in the REPL buffer to interrupt back into lldb.
+       "cont"))))
 
 ;;;###autoload
 (defun swift-mode:debug-ios-app (&optional project-directory
@@ -977,7 +1223,10 @@ CONFIG config for build Debug / Release etc."
         swift-mode:ios-device-identifier)
       (if current-prefix-arg
           (swift-mode:read-project-scheme project-directory)
-        swift-mode:ios-project-scheme))))
+        swift-mode:ios-project-scheme)
+      (if current-prefix-arg
+          (swift-mode:read-project-configuration project-directory)
+        swift-mode:ios-project-configuration))))
   (setq project-directory
         (swift-mode:ensure-xcode-project-directory project-directory))
   (unless device-identifier
@@ -993,7 +1242,10 @@ CONFIG config for build Debug / Release etc."
            (swift-mode:read-project-scheme project-directory))))
   (setq swift-mode:ios-project-scheme scheme)
   (unless config
-    (setq config swift-mode:ios-project-configuration))
+    (setq config
+          (or
+           swift-mode:ios-project-configuration
+           (swift-mode:read-project-configuration project-directory))))
   (setq swift-mode:ios-project-configuration config)
   (let* ((local-device-build (equal device-identifier
                                     swift-mode:ios-local-device-identifier))
