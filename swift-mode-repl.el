@@ -801,7 +801,7 @@ An list ARGS are appended for builder command line arguments."
                                            device-identifier
                                            scheme
                                            config
-                                           synchronous)
+                                           after-build)
   "Build an iOS app in the PROJECT-DIRECTORY.
 Build it for iOS device DEVICE-IDENTIFIER for the given SCHEME.
 If PROJECT-DIRECTORY is nil or omitted, it is searched from `default-directory'
@@ -813,9 +813,16 @@ equal to `swift-mode:ios-local-device-identifier', a local device is used via
 SCHEME is the name of the project scheme in Xcode.  If it is nil or omitted,
 the value of `swift-mode:ios-project-scheme' is used.
 CONFIG is the configuration for build/debug Debug/Release etc.
-If SYNCHRONOUS is non-nil, block until the build completes (needed by the
-debug flow, which must install/launch the freshly-built app).  When nil,
-the build runs asynchronously through `compilation-mode'."
+
+The build always runs asynchronously through `compilation-mode' so other
+buffers stay usable while xcodebuild runs.  Output appears live in the
+*swift-mode:build* buffer.
+
+If AFTER-BUILD is a function, it is called with one argument — the
+compilation finish STATUS string passed to `compilation-finish-functions'
+\(e.g. \"finished\\n\" on success, or an exit-code message on failure) —
+when the build completes.  The debug flow uses this to chain post-build
+install / launch / attach-debugger steps without blocking Emacs."
   (interactive
    (let* ((default-project-directory
            (or
@@ -825,6 +832,19 @@ the build runs asynchronously through `compilation-mode'."
            (if current-prefix-arg
                (swift-mode:read-project-directory default-project-directory)
              default-project-directory)))
+     ;; Kick off xcodebuild in the background BEFORE any widget appears.
+     ;; Non-blocking: returns immediately.  The subprocess runs in
+     ;; parallel with the device dialog (widget-choose's read-key-sequence
+     ;; lets sentinels fire), so by the time we need scheme/config data
+     ;; it's typically already cached and the next dialog opens instantly.
+     (when current-prefix-arg
+       (swift-mode:start-xcodebuild-list-async project-directory)
+       (let ((xcodeproj
+              (car (directory-files project-directory t
+                                    ".*\\.xcodeproj\\'"))))
+         (when xcodeproj
+           (swift-mode:start-xcodebuild-list-async project-directory
+                                                   xcodeproj))))
      (list
       project-directory
       (if current-prefix-arg
@@ -857,36 +877,43 @@ the build runs asynchronously through `compilation-mode'."
            (swift-mode:read-project-configuration project-directory))))
   (setq swift-mode:ios-project-configuration config)
 
-  (with-current-buffer (get-buffer-create "*swift-mode:compilation*")
-    (fundamental-mode)
-    (setq buffer-read-only nil)
-    (let ((progress-reporter (make-progress-reporter "Building..."))
-          (xcodebuild-args `(,swift-mode:xcodebuild-executable
-                             ,@(swift-mode:xcodebuild-project-args
-                                project-directory)
-                             "-quiet"
-                             "-disableAutomaticPackageResolution"
-                             "-skipPackagePluginValidation"
-                             "-skipMacroValidation"
-                             "-configuration" ,config
-                             "-scheme" ,scheme)))
-      (if (equal device-identifier swift-mode:ios-local-device-identifier)
-          (setq xcodebuild-args (append xcodebuild-args '("-sdk" "iphoneos")))
-        (setq xcodebuild-args
-              (append xcodebuild-args
-                      `("-destination"
-                        ,(concat "platform=iOS Simulator,id=" device-identifier)
-                        "-sdk" "iphonesimulator"))))
-      (let ((default-directory project-directory))
-        (if synchronous
-            (unless (zerop (apply #'swift-mode:call-process xcodebuild-args))
-              (compilation-mode)
-              (goto-char (point-min))
-              (pop-to-buffer (current-buffer))
-              (error "Build error"))
-          (apply #'swift-mode:call-process-async xcodebuild-args)))
-      (kill-buffer)
-      (progress-reporter-done progress-reporter))))
+  (let* ((local-device-build (equal device-identifier
+                                    swift-mode:ios-local-device-identifier))
+         (xcodebuild-args
+          `(,swift-mode:xcodebuild-executable
+            ,@(swift-mode:xcodebuild-project-args project-directory)
+            "-quiet"
+            "-disableAutomaticPackageResolution"
+            "-skipPackagePluginValidation"
+            "-skipMacroValidation"
+            "-configuration" ,config
+            "-scheme" ,scheme
+            ,@(if local-device-build
+                  '("-sdk" "iphoneos")
+                `("-destination"
+                  ,(concat "platform=iOS Simulator,id=" device-identifier)
+                  "-sdk" "iphonesimulator"))))
+         (cmd-string
+          (mapconcat #'shell-quote-argument xcodebuild-args " "))
+         (buffer-name "*swift-mode:build*")
+         (default-directory project-directory))
+    (compilation-start cmd-string nil (lambda (_) buffer-name))
+    (when after-build
+      (let ((compile-buffer (get-buffer buffer-name)))
+        (when compile-buffer
+          (with-current-buffer compile-buffer
+            ;; Buffer-local hook: chain post-build steps without
+            ;; clobbering any global `compilation-finish-functions'.
+            (setq-local compilation-finish-functions
+                        (cons
+                         (lambda (_buf status)
+                           (condition-case err
+                               (funcall after-build status)
+                             (error
+                              (message
+                               "swift-mode after-build callback error: %s"
+                               (error-message-string err)))))
+                         compilation-finish-functions))))))))
 
 (defun swift-mode:wait-for-prompt-then-execute-commands (string)
   "Execute the next command from the queue if we're at a fresh prompt.
@@ -1108,18 +1135,27 @@ The buffer is preserved so its history remains reviewable."
   "Run debugger on an iOS app in the PROJECT-DIRECTORY.
 Run it for the iOS local device DEVICE-IDENTIFIER for the given SCHEME.
 CODESIGNING-FOLDER-PATH is the path of the codesigning folder in Xcode
-build settings."
+build settings.
+
+The build runs asynchronously; the REPL is launched from a
+`compilation-finish-functions' hook when xcodebuild completes, so other
+buffers stay usable during the build."
   (swift-mode:kill-existing-debug-repl)
-  (swift-mode:build-ios-app project-directory
-                            swift-mode:ios-local-device-identifier
-                            scheme
-                            nil
-                            t)
-  (swift-mode:run-repl
-   (append
-    (swift-mode:command-string-to-list swift-mode:ios-deploy-executable)
-    (list "--debug" "--no-wifi" "--bundle" codesigning-folder-path))
-   nil t))
+  (swift-mode:build-ios-app
+   project-directory
+   swift-mode:ios-local-device-identifier
+   scheme
+   nil
+   (lambda (status)
+     (cond
+      ((not (string-prefix-p "finished" status))
+       (message "iOS build failed: %s" (string-trim status)))
+      (t
+       (swift-mode:run-repl
+        (append
+         (swift-mode:command-string-to-list swift-mode:ios-deploy-executable)
+         (list "--debug" "--no-wifi" "--bundle" codesigning-folder-path))
+        nil t))))))
 
 ;;;###autoload
 (defun swift-mode:debug-ios-app-on-simulator (project-directory
@@ -1134,9 +1170,32 @@ SCHEME is the name of the project scheme in Xcode.
 CODESIGNING-FOLDER-PATH is the path of the codesigning folder used in Xcode
 build settings.
 PRODUCT-BUNDLE-IDENTIFIER is the name of the product bundle identifier used
-in Xcode build settings."
+in Xcode build settings.
+
+The build runs asynchronously.  The simulator boot, app install, launch
+and debugger attach steps are chained from a `compilation-finish-functions'
+hook so other buffers stay usable while xcodebuild runs."
   (swift-mode:kill-existing-debug-repl)
-  (swift-mode:build-ios-app project-directory device-identifier scheme nil t)
+  (swift-mode:build-ios-app
+   project-directory device-identifier scheme nil
+   (lambda (status)
+     (cond
+      ((not (string-prefix-p "finished" status))
+       (message "iOS build failed: %s" (string-trim status)))
+      (t
+       (swift-mode:--debug-ios-app-on-simulator-after-build
+        device-identifier
+        codesigning-folder-path
+        product-bundle-identifier))))))
+
+(defun swift-mode:--debug-ios-app-on-simulator-after-build
+    (device-identifier codesigning-folder-path product-bundle-identifier)
+  "Post-build half of `swift-mode:debug-ios-app-on-simulator'.
+
+Runs after xcodebuild succeeds (invoked from
+`compilation-finish-functions'): boots the simulator if needed, installs
+the freshly-built app, launches it suspended, then starts an lldb REPL
+and attaches to the launched process."
   (let* ((devices (swift-mode:list-ios-simulator-devices))
          (target-device
           (seq-find
@@ -1216,6 +1275,17 @@ CONFIG config for build Debug / Release etc."
            (if current-prefix-arg
                (swift-mode:read-project-directory default-project-directory)
              default-project-directory)))
+     ;; Kick off xcodebuild in the background BEFORE any widget appears
+     ;; so it overlaps with the user's device-picking time.  See the
+     ;; matching block in `swift-mode:debug-ios-app' for details.
+     (when current-prefix-arg
+       (swift-mode:start-xcodebuild-list-async project-directory)
+       (let ((xcodeproj
+              (car (directory-files project-directory t
+                                    ".*\\.xcodeproj\\'"))))
+         (when xcodeproj
+           (swift-mode:start-xcodebuild-list-async project-directory
+                                                   xcodeproj))))
      (list
       project-directory
       (if current-prefix-arg
