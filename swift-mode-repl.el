@@ -523,29 +523,49 @@ SDK is the name of the SDK build against.
 DEVICE-IDENTIFIER is used as the destination parameter for xcodebuild.  If
 identifier is equal to `swift-mode:ios-local-device-identifier', it is not
 passed as a destination to xcodebuild.
-CONFIG config for build."
+CONFIG config for build.
+
+Runs `xcodebuild -showBuildSettings' as a real subprocess and pumps
+output/redisplay in a loop so the frame keeps drawing while waiting
+\(otherwise this call would freeze Emacs for several seconds on large
+projects).  C-g aborts."
   (with-temp-buffer
-    (let ((default-directory project-directory)
-          (arglist `(,swift-mode:xcodebuild-executable
-                     ,@(swift-mode:xcodebuild-project-args project-directory)
-                     "-disableAutomaticPackageResolution"
-                     "-configuration"
-                     ,config
-                     "-sdk"
-                     ,sdk
-                     "-scheme"
-                     ,scheme
-                     "-showBuildSettings")))
-      (when (and device-identifier
-                 (not (equal device-identifier
-                             swift-mode:ios-local-device-identifier)))
-        (setq arglist
-              (append
-               arglist
-               `("-destination"
-                 ,(concat "platform=iOS Simulator,id=" device-identifier)))))
-      (unless (zerop (apply #'swift-mode:call-process arglist))
-        (error "%s %s" "Cannot read Xcode build settings" (buffer-string))))
+    (let* ((default-directory project-directory)
+           (cmd (append
+                 (swift-mode:command-string-to-list
+                  swift-mode:xcodebuild-executable)
+                 (swift-mode:xcodebuild-project-args project-directory)
+                 (list "-disableAutomaticPackageResolution"
+                       "-configuration" config
+                       "-sdk" sdk
+                       "-scheme" scheme
+                       "-showBuildSettings")
+                 (when (and device-identifier
+                            (not (equal device-identifier
+                                        swift-mode:ios-local-device-identifier)))
+                   (list "-destination"
+                         (concat "platform=iOS Simulator,id="
+                                 device-identifier)))))
+           (proc nil))
+      (unwind-protect
+          (progn
+            (setq proc (make-process
+                        :name "swift-mode:read-build-settings"
+                        :buffer (current-buffer)
+                        :command cmd
+                        :connection-type 'pipe
+                        :noquery t))
+            (while (process-live-p proc)
+              (message "Reading Xcode build settings...")
+              (accept-process-output proc 0.1)
+              (redisplay))
+            (while (accept-process-output proc 0))
+            (message "")
+            (unless (zerop (process-exit-status proc))
+              (error "Cannot read Xcode build settings: %s"
+                     (buffer-string))))
+        (when (and proc (process-live-p proc))
+          (delete-process proc))))
     (goto-char (point-min))
     (let ((settings nil))
       (while (search-forward-regexp " *\\([_a-zA-Z0-9]+\\) *= *\\(.*\\)" nil t)
@@ -880,7 +900,13 @@ install / launch / attach-debugger steps without blocking Emacs."
   (let* ((local-device-build (equal device-identifier
                                     swift-mode:ios-local-device-identifier))
          (xcodebuild-args
-          `(,swift-mode:xcodebuild-executable
+          ;; `swift-mode:xcodebuild-executable' may be a string like
+          ;; "xcrun xcodebuild" — split it into argv parts so that
+          ;; `shell-quote-argument' below quotes each token separately
+          ;; instead of producing "xcrun\\ xcodebuild" which the shell
+          ;; would treat as a single (missing) command.
+          `(,@(swift-mode:command-string-to-list
+               swift-mode:xcodebuild-executable)
             ,@(swift-mode:xcodebuild-project-args project-directory)
             "-quiet"
             "-disableAutomaticPackageResolution"
